@@ -1,0 +1,29 @@
+{
+  "database_path": "./btc-event-data.sqlite",
+  "binance_rest": "https://fapi.binance.com",
+  "binance_index_stream": "wss://fstream.binance.com/market/ws/btcusdt@markPrice@1s",
+  "openmarket_mcp": "https://mcp.openmarket.xyz/",
+  "openmarket_credentials_path": "~/.local/share/btc-event-shadow/openmarket.json",
+  "timeout_seconds": 15,
+  "read_retries": 2,
+  "page_limit": 1000,
+  "max_websocket_connections": 5,
+  "openmarket_lookback": "1h",
+  "openmarket_interval": "FIVE_MINUTES",
+  "openmarket_book_block_size": 100,
+  "min_feature_kinds": [
+    "cvd",
+    "book_imbalance"
+  ],
+  "dataset_max_age_ms": 600000,
+  "metric_max_age_ms": {"cvd": 300000, "book_imbalance": 60000},
+  "required_feature_kinds": [
+    "cvd",
+    "book_imbalance",
+    "OPEN_INTEREST_AGG",
+    "FUNDING_RATE_AGG",
+    "TRADE_AGG:BUY",
+    "TRADE_AGG:SELL"
+  ],
+  "stream_gap_threshold_ms": 1500
+}

@@ -1,0 +1,26 @@
+/* Login surface, kept in a Tailwind-compatible base/components layer. */
+@layer base {
+  * { box-sizing: border-box; }
+  html { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif; }
+  body { margin: 0; background: #0b1114; color: #e8f2f0; }
+  button, input { font: inherit; }
+}
+@layer components {
+  .login-shell { min-height: 100dvh; display: grid; place-items: center; padding: max(24px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom)); background: radial-gradient(circle at top left, #193a37 0, #0b1114 42%); }
+  .login-card { width: min(100%, 420px); padding: clamp(24px, 5vw, 38px); border: 1px solid #344b4c; border-radius: 18px; background: #172124; box-shadow: 0 22px 70px #0008; }
+  .mark { display: grid; place-items: center; width: 44px; height: 44px; border-radius: 12px; color: #082019; background: #77dcba; font-size: 25px; font-weight: 800; }
+  .eyebrow { margin: 24px 0 5px; color: #82cdb6; font-size: 11px; font-weight: 700; letter-spacing: .18em; }
+  h1 { margin: 0; font-size: clamp(26px, 7vw, 34px); line-height: 1.2; }
+  .intro, .note { color: #a7bab9; font-size: 13px; line-height: 1.6; }
+  .intro { margin: 12px 0 26px; }
+  label { display: block; margin: 17px 0 7px; color: #cfddda; font-size: 13px; font-weight: 650; }
+  input:not([type=checkbox]) { width: 100%; min-height: 48px; padding: 12px 14px; border: 1px solid #43595a; border-radius: 9px; outline: none; color: #f3f9f7; background: #0f191b; font-size: 16px; }
+  input:focus-visible, button:focus-visible { outline: 2px solid #77dcba; outline-offset: 2px; }
+  .remember { display: flex; align-items: center; gap: 10px; min-height: 48px; margin: 12px 0 20px; font-weight: 400; cursor: pointer; }
+  .remember input { width: 18px; height: 18px; accent-color: #77dcba; }
+  button { width: 100%; min-height: 48px; border: 0; border-radius: 9px; color: #092018; background: #77dcba; font-weight: 750; cursor: pointer; }
+  button:hover { background: #9beacd; }
+  .error { padding: 12px; border: 1px solid #c66e72; border-radius: 8px; color: #ffd1d0; background: #43272a; font-size: 13px; }
+  .note { margin: 18px 0 0; }
+}
+@media (max-width: 480px) { .login-shell { align-items: start; padding-top: max(10vh, env(safe-area-inset-top)); } .login-card { border-radius: 14px; } }

@@ -1,0 +1,20 @@
+{
+  "source_id": "BINANCE_FUTURES_KLINES",
+  "market_data_url": "https://fapi.binance.com/fapi/v1/klines",
+  "market_request_attempts": 2,
+  "market_request_timeout_seconds": 5,
+  "market_retry_delay_seconds": 0.5,
+  "symbol": "BTCUSDT",
+  "exchange": "BINANCE_FUTURES",
+  "five_min": {"interval": "5m", "period_ms": 300000},
+  "one_min": {"interval": "1m", "period_ms": 60000},
+  "minimum_close_lag_ms": 1000,
+  "maximum_close_lag_ms": 55000,
+  "market_history_bars": 120,
+  "minimum_indicator_bars": 40,
+  "bb_length": 20,
+  "bb_stddev_multiplier": "2",
+  "entry_step_ms": 60000,
+  "horizon_ms": 1800000,
+  "version": "bb_dual_touch_30m_v1"
+}

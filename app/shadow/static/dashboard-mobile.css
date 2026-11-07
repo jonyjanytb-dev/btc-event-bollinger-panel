@@ -1,0 +1,77 @@
+/* Responsive overrides for the Tailwind-built dashboard stylesheet. */
+@media (max-width: 640px) {
+  html, body { max-width: 100%; overflow-x: hidden; }
+  .shell { padding: max(12px, env(safe-area-inset-top)) 10px max(20px, env(safe-area-inset-bottom)); }
+  .top { display: block; margin-bottom: 14px; padding-bottom: 13px; }
+  .brand { gap: 10px; }
+  .brand h1 { font-size: 18px; }
+  .brand .sub { font-size: 11px; }
+  .topright { margin-top: 12px; flex-direction: row; justify-content: space-between; align-items: center; }
+  .topright #updated { display: inline; font-size: 11px; }
+  .layout, .main, .sidebar, .panel, .panel-head, .chart-wrap { min-width: 0; }
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 12px; }
+  .metric { padding: 12px; min-height: 102px; }
+  .metric-label { line-height: 1.35; }
+  .metric-value { font-size: clamp(18px, 5.8vw, 24px); overflow-wrap: anywhere; }
+  .panel { padding: 14px; margin-bottom: 12px; }
+  .panel-head h2 { font-size: 16px; line-height: 1.35; }
+  .panel-head .hint { line-height: 1.55; }
+  .controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; gap: 9px; }
+  .controls select, .controls input, .controls button { width: 100%; min-width: 0; min-height: 44px; font-size: 16px; }
+  .panel-head .controls #mechanism { grid-column: 1 / -1; }
+  .chart-wrap { height: clamp(270px, 49vh, 390px); }
+  .legend { flex-wrap: wrap; gap: 8px 14px; }
+  #scheduled-paper-panel > .controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  #scheduled-paper-panel > .controls > span:first-child { grid-column: 1 / -1; }
+  #scheduled-paper-panel > .controls > span:last-child { grid-column: 1 / -1; }
+  .table-wrap { border: 0; overflow: visible; }
+  .table-wrap table { display: block; width: 100%; min-width: 0; }
+  .table-wrap thead { display: none; }
+  .table-wrap tbody { display: grid; gap: 10px; }
+  .table-wrap tbody tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; padding: 12px; border: 1px solid #344549; border-radius: 9px; background: #172225; }
+  .table-wrap tbody tr:hover { background: #172225; }
+  .table-wrap tbody td { display: flex; flex-direction: column; min-width: 0; padding: 0; border: 0; white-space: normal; overflow-wrap: anywhere; font-size: 13px; line-height: 1.45; }
+  .table-wrap tbody td::before { display: block; margin-bottom: 3px; color: #92a9aa; font-size: 11px; font-weight: 600; }
+  .table-wrap tbody td.empty { grid-column: 1 / -1; display: block; padding: 22px 4px; text-align: center; }
+  .table-wrap tbody td.empty::before { display: none; }
+  #scheduled-paper-panel td:nth-child(1)::before { content: "周期"; }
+  #scheduled-paper-panel td:nth-child(2)::before { content: "方向"; }
+  #scheduled-paper-panel td:nth-child(3)::before { content: "模拟金额"; }
+  #scheduled-paper-panel td:nth-child(4)::before { content: "入场时间"; }
+  #scheduled-paper-panel td:nth-child(5)::before { content: "到期时间"; }
+  #scheduled-paper-panel td:nth-child(6)::before { content: "本根收盘代理"; }
+  #scheduled-paper-panel td:nth-child(7)::before { content: "下根收盘代理"; }
+  #scheduled-paper-panel td:nth-child(8)::before { content: "K 线方向"; }
+  #scheduled-paper-panel td:nth-child(9)::before { content: "入场代理价"; }
+  #scheduled-paper-panel td:nth-child(10)::before { content: "到期代理价"; }
+  #scheduled-paper-panel td:nth-child(11)::before { content: "合约代理结果"; }
+  #scheduled-paper-panel td:nth-child(11) { grid-column: 1 / -1; }
+  #chart-strategy-panel td:nth-child(1)::before { content: "收到时间"; }
+  #chart-strategy-panel td:nth-child(2)::before { content: "候选方向"; }
+  #chart-strategy-panel td:nth-child(3)::before { content: "入场时间"; }
+  #chart-strategy-panel td:nth-child(4)::before { content: "到期时间"; }
+  #chart-strategy-panel td:nth-child(5)::before { content: "入场代理价"; }
+  #chart-strategy-panel td:nth-child(6)::before { content: "到期代理价"; }
+  #chart-strategy-panel td:nth-child(7)::before { content: "结果"; }
+  #chart-strategy-panel td:nth-child(8)::before { content: "原因"; }
+  #chart-strategy-panel td:nth-child(8) { grid-column: 1 / -1; }
+  #model-history-panel td:nth-child(1)::before { content: "决策时间"; }
+  #model-history-panel td:nth-child(2)::before { content: "周期"; }
+  #model-history-panel td:nth-child(3)::before { content: "策略"; }
+  #model-history-panel td:nth-child(4)::before { content: "预测方向"; }
+  #model-history-panel td:nth-child(5)::before { content: "入场代理价"; }
+  #model-history-panel td:nth-child(6)::before { content: "到期代理价"; }
+  #model-history-panel td:nth-child(7)::before { content: "概率"; }
+  #model-history-panel td:nth-child(8)::before { content: "筛选"; }
+  #model-history-panel td:nth-child(9)::before { content: "代理结果"; }
+  #model-history-panel td:nth-child(10)::before { content: "执行"; }
+  #model-history-panel td:nth-child(10) { grid-column: 1 / -1; }
+  .health-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .footer { padding: 10px 0 20px; line-height: 1.5; }
+  .toast { right: 10px; left: 10px; bottom: max(10px, env(safe-area-inset-bottom)); }
+}
+@media (max-width: 360px) {
+  .metric { min-height: 112px; }
+  .table-wrap tbody tr { grid-template-columns: 1fr; }
+  #scheduled-paper-panel td:nth-child(11), #chart-strategy-panel td:nth-child(8), #model-history-panel td:nth-child(10) { grid-column: auto; }
+}

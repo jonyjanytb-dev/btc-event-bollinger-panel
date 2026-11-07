@@ -1,0 +1,12 @@
+{
+  "strategy_version": "bb_dual_touch_30m_intrabar_v2",
+  "poll_seconds": 1.0,
+  "request_timeout_seconds": 2.0,
+  "request_attempts": 2,
+  "retry_delay_seconds": 0.15,
+  "max_snapshot_duration_ms": 2500,
+  "max_observation_gap_ms": 5000,
+  "market_history_bars": 40,
+  "minimum_indicator_bars": 40,
+  "proxy_resolve_seconds": 10
+}

@@ -1,0 +1,22 @@
+{
+  "symbol": "BTCUSDT",
+  "horizons": [30, 60],
+  "research_payout_ratio": "0.85",
+  "research_probability_margin": "0.03",
+  "data_directory": ".local-test/shadow-isolated",
+  "index_history_path": "/path/to/index-1m.jsonl",
+  "collector_config_path": "/path/to/collector-config.json",
+  "oauth_mode": "dedicated",
+  "oauth_credentials_path": "~/.local/share/btc-event-shadow/oauth.json",
+  "poll_seconds": 60,
+  "health_max_age_ms": 180000,
+  "openmarket_max_age_ms": 600000,
+  "cvd_max_age_ms": 120000,
+  "clock_max_error_ms": 1000,
+  "clock_server": "time.cloudflare.com",
+  "tick_gap_threshold_ms": 1500,
+  "tick_max_delay_ms": 5000,
+  "proxy_price_window_ms": 5000,
+  "min_free_bytes": 104857600,
+  "preparation_lead_ms": 45000
+}
