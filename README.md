@@ -7,7 +7,7 @@
 ## 内容
 
 - `app/`：行情采集、观察面板、站点认证、交易控制、私有下单桥接和测试。
-- `chart-strategy/`：1 分钟与 5 分钟盘中双触布林带观察器。
+- `chart-strategy/`：支持选择 1m、5m、10m、15m、30m 和 1h 多周期共同触及布林带的盘中观察器。
 - `scripts/configure.py`：为每台服务器生成私有配置、systemd 用户服务与 Caddy 配置，不覆盖已有配置。
 - `scripts/capture_binance_session.py`：可选的本地可见浏览器扫码辅助工具；仅在客户同意并亲自扫码时使用。
 - `skills/btc-client-deploy/`：给 Codex 使用的客户部署 skill，包括给腾讯云服务器 AI 的指令模板。
@@ -49,6 +49,8 @@ PYTHONPATH=app venv/bin/python -m shadow.bootstrap --credentials "$HOME/openmark
 ## 客户币安登录与真实交易
 
 站点账号与币安账号完全独立。客户可在自己的可信浏览器完成币安登录；可选辅助脚本需要 Playwright：
+
+交易页支持固定金额或自定义三档亏损阶梯。阶梯按指数代理结果自动推进；代理结果与币安真实成交、结算可能不同，结果缺失时会等待而不继续推进。该选项不会自动启用真实交易。
 
 ```bash
 venv/bin/pip install -r scripts/requirements-login.txt

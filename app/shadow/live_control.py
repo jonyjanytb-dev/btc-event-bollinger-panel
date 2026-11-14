@@ -12,10 +12,13 @@ from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from uuid import uuid4
+from .signal_periods import PERIOD_MS, valid_periods
+from .ladder import LadderError, next_step, validate_stakes
 
 LEGACY_STRATEGY = "bb_dual_touch_30m_v1"
 STRATEGY = "bb_dual_touch_30m_intrabar_v2"
-SUPPORTED_STRATEGIES = frozenset((LEGACY_STRATEGY, STRATEGY))
+MULTI_STRATEGY = "bb_multi_touch_intrabar_v3"
+SUPPORTED_STRATEGIES = frozenset((LEGACY_STRATEGY, STRATEGY, MULTI_STRATEGY))
 HORIZON_MS = 30 * 60_000
 PERIOD_ENUMS = {10: "TEN_MINUTE", 30: "THIRTY_MINUTE", 60: "ONE_HOUR"}
 DIRECTION_MODES = frozenset(("SIGNAL", "REVERSE", "LONG_ONLY", "SHORT_ONLY"))
@@ -60,6 +63,24 @@ def eligible_signal(row: dict, now_ms: int, *, strategy: str | None = None) -> s
                 or decision.get("entry_ms") != entry
                 or decision.get("expiry_ms") != expiry
                 or not received <= entry <= now_ms):
+            return None
+        if version == MULTI_STRATEGY:
+            periods = valid_periods(decision.get("periods"))
+            opens = decision.get("period_open_ms")
+            longest = periods[-1]
+            if (periods == ("1m", "5m") or not isinstance(opens, dict)
+                    or set(opens) != set(periods)
+                    or now_ms > entry + INTRABAR_ENTRY_LAG_MS or entry != received
+                    or decision.get("source") != "BINANCE_FUTURES_KLINES"
+                    or any(type(opens[p]) is not int or opens[p] != received // PERIOD_MS[p] * PERIOD_MS[p]
+                           for p in periods)
+                    or decision.get("bar_open_ms") != opens[longest]
+                    or decision.get("bar_close_ms") != opens[longest] + PERIOD_MS[longest]):
+                return None
+            if direction == "HIGHER" and reason == "BOTH_LOWER_TOUCHED_INTRABAR":
+                return "LONG"
+            if direction == "LOWER" and reason == "BOTH_UPPER_TOUCHED_INTRABAR":
+                return "SHORT"
             return None
         if version == STRATEGY:
             five_open = decision.get("bar_open_ms")
@@ -142,6 +163,25 @@ class LiveControl:
                 self.db.execute("UPDATE attempts SET release_buffer_ms=300000 WHERE state='API_ACCEPTED_UNVERIFIED' AND (SELECT cooldown_five_minutes FROM config WHERE id=1)=1")
                 self.db.execute("CREATE TABLE live_proxy_results(attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),status TEXT NOT NULL,entry_price TEXT,exit_price TEXT,outcome TEXT,entry_event_ms INTEGER,exit_event_ms INTEGER,resolved_ms INTEGER NOT NULL)")
                 self.db.execute("PRAGMA user_version=6")
+        # Keep the v6 format compatible with a worker/web process still running
+        # during rollout. The extra table contains only safe state transitions.
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='live_signal_events'").fetchone():
+            with self.transaction():
+                self.db.execute("CREATE TABLE IF NOT EXISTS live_signal_events("
+                                "id INTEGER PRIMARY KEY, event_ms INTEGER NOT NULL, code TEXT NOT NULL,"
+                                "observation_id INTEGER, cursor INTEGER, enabled INTEGER,"
+                                "strategy TEXT, processing_lag_ms INTEGER,"
+                                "UNIQUE(observation_id,code))")
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='live_ladder'").fetchone():
+            with self.transaction():
+                self.db.execute("CREATE TABLE IF NOT EXISTS live_ladder("
+                                "id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL,"
+                                "stakes TEXT NOT NULL, step INTEGER NOT NULL CHECK(step BETWEEN 0 AND 2),"
+                                "last_attempt_id TEXT, applied_attempt_id TEXT, updated_ms INTEGER NOT NULL)")
+                self.db.execute("CREATE TABLE IF NOT EXISTS live_ladder_results("
+                                "attempt_id TEXT PRIMARY KEY, outcome TEXT NOT NULL,"
+                                "step_before INTEGER NOT NULL, step_after INTEGER NOT NULL,"
+                                "applied_ms INTEGER NOT NULL)")
 
     @contextmanager
     def transaction(self):
@@ -156,6 +196,50 @@ class LiveControl:
     def close(self):
         self.db.close()
 
+    def _signal_event(self, code: str, event_ms: int, config, *,
+                      observation_id: int | None = None,
+                      processing_lag_ms: int | None = None):
+        self.db.execute(
+            "INSERT OR IGNORE INTO live_signal_events("
+            "event_ms,code,observation_id,cursor,enabled,strategy,processing_lag_ms) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (event_ms, code, observation_id,
+             config["cursor"] if config else None,
+             config["enabled"] if config else None,
+             config["strategy"] if config else None,
+             processing_lag_ms))
+
+    def signal_events(self, limit: int = 200) -> list[dict]:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise LiveControlError("INVALID_EVENT_LIMIT")
+        rows = self.db.execute(
+            "SELECT * FROM live_signal_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def disabled_audit_cursor(self) -> int:
+        config = self.state()
+        if not config:
+            return 0
+        row = self.db.execute(
+            "SELECT MAX(observation_id) FROM live_signal_events "
+            "WHERE code IN ('DISABLED_SIGNAL','PRE_DISABLE_UNCONSUMED')").fetchone()
+        return max(config["cursor"], row[0] or 0)
+
+    def audit_disabled_observations(self, rows: list[dict], now_ms: int):
+        if not rows:
+            return
+        with self.transaction():
+            config = self.db.execute("SELECT * FROM config WHERE id=1").fetchone()
+            if not config or config["enabled"]:
+                return
+            for row in rows:
+                received = row.get("received_ms")
+                if type(row.get("id")) is not int or type(received) is not int:
+                    continue
+                code = "DISABLED_SIGNAL" if received >= config["updated_ms"] else "PRE_DISABLE_UNCONSUMED"
+                self._signal_event(code, now_ms, config, observation_id=row["id"],
+                                   processing_lag_ms=now_ms-received)
+
     def recover_pending(self, now_ms: int) -> int:
         """Fail closed after restart; an interrupted send cannot be retried."""
         with self.transaction():
@@ -164,6 +248,7 @@ class LiveControl:
             if count:
                 self.db.execute("UPDATE attempts SET state='UNKNOWN',updated_ms=? WHERE state IN ('RESERVED','SUBMITTING')", (now_ms,))
                 self.db.execute("UPDATE config SET enabled=0,updated_ms=? WHERE id=1", (now_ms,))
+                self._signal_event("SAFETY_STOP", now_ms, self.db.execute("SELECT * FROM config WHERE id=1").fetchone())
             return count
 
     def __enter__(self):
@@ -175,10 +260,15 @@ class LiveControl:
     def enable(self, *, strategy: str, horizon: int, amount: str,
                max_amount: str, current_observation_id: int, now_ms: int,
                reverse: bool = False, cooldown_five_minutes: bool = False,
-               direction_mode: str | None = None):
+               direction_mode: str | None = None, ladder_stakes: list[str] | None = None):
         stake, cap = _amount(amount), _amount(max_amount)
+        try:
+            steps = validate_stakes(ladder_stakes, max_amount) if ladder_stakes is not None else None
+        except LadderError:
+            raise LiveControlError("INVALID_LADDER_STAKES") from None
         mode = direction_mode if direction_mode is not None else ("REVERSE" if reverse else "SIGNAL")
         if (strategy not in SUPPORTED_STRATEGIES or type(horizon) is not int or horizon not in PERIOD_ENUMS or stake < 5 or stake > cap
+                or (steps is not None and stake != Decimal(steps[0]))
                 or type(current_observation_id) is not int or current_observation_id < 0
                 or type(now_ms) is not int or type(reverse) is not bool
                 or type(cooldown_five_minutes) is not bool or type(mode) is not str or mode not in DIRECTION_MODES
@@ -189,14 +279,61 @@ class LiveControl:
                 raise LiveControlError("UNRESOLVED_ATTEMPT")
             self.db.execute("INSERT INTO config(id,enabled,strategy,horizon,amount,cursor,updated_ms,reverse,cooldown_five_minutes,direction_mode) VALUES(1,1,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET enabled=1,strategy=excluded.strategy,horizon=excluded.horizon,amount=excluded.amount,cursor=excluded.cursor,updated_ms=excluded.updated_ms,reverse=excluded.reverse,cooldown_five_minutes=excluded.cooldown_five_minutes,direction_mode=excluded.direction_mode",
                             (strategy, horizon, str(stake), current_observation_id, now_ms, int(mode == "REVERSE"), int(cooldown_five_minutes), mode))
+            prior = self.db.execute("SELECT * FROM live_ladder WHERE id=1").fetchone()
+            if steps is None:
+                self.db.execute("DELETE FROM live_ladder WHERE id=1")
+            elif not prior or not prior["enabled"] or json.loads(prior["stakes"]) != list(steps):
+                self.db.execute("INSERT INTO live_ladder VALUES(1,1,?,0,NULL,NULL,?) "
+                                "ON CONFLICT(id) DO UPDATE SET enabled=1,stakes=excluded.stakes,"
+                                "step=0,last_attempt_id=NULL,applied_attempt_id=NULL,updated_ms=excluded.updated_ms",
+                                (json.dumps(steps), now_ms))
+            self._signal_event("ENABLED", now_ms, self.db.execute("SELECT * FROM config WHERE id=1").fetchone())
 
     def disable(self, now_ms: int):
         with self.transaction():
             self.db.execute("UPDATE config SET enabled=0,updated_ms=? WHERE id=1", (now_ms,))
+            self._signal_event("DISABLED", now_ms, self.db.execute("SELECT * FROM config WHERE id=1").fetchone())
 
     def state(self):
         row = self.db.execute("SELECT * FROM config WHERE id=1").fetchone()
         return dict(row) if row else None
+
+    def ladder_state(self) -> dict:
+        row = self.db.execute("SELECT * FROM live_ladder WHERE id=1").fetchone()
+        if not row:
+            return {"enabled": False, "stakes": ["5", "7", "15"], "step": 0,
+                    "waiting_for_result": False, "last_attempt_id": None}
+        stakes = json.loads(row["stakes"])
+        return {"enabled": bool(row["enabled"]), "stakes": stakes,
+                "step": row["step"], "next_amount": stakes[row["step"]],
+                "waiting_for_result": bool(row["enabled"] and row["last_attempt_id"]
+                                           and row["last_attempt_id"] != row["applied_attempt_id"]),
+                "last_attempt_id": row["last_attempt_id"]}
+
+    def advance_ladder(self, now_ms: int) -> bool:
+        """Apply one completed proxy outcome once; unknown results retain the stage."""
+        with self.transaction():
+            ladder = self.db.execute("SELECT * FROM live_ladder WHERE id=1").fetchone()
+            if (not ladder or not ladder["enabled"] or not ladder["last_attempt_id"]
+                    or ladder["last_attempt_id"] == ladder["applied_attempt_id"]):
+                return False
+            row = self.db.execute(
+                "SELECT a.state,p.status,p.outcome FROM attempts a "
+                "LEFT JOIN live_proxy_results p ON p.attempt_id=a.id WHERE a.id=?",
+                (ladder["last_attempt_id"],)).fetchone()
+            if not row or row["state"] not in ("TIME_EXPIRED_UNVERIFIED", "USER_REVIEWED_UNVERIFIED"):
+                return False
+            result = (row["outcome"] if row["status"] == "VERIFIED"
+                      and row["outcome"] in ("WIN", "LOSS") else
+                      "EQUAL" if row["status"] == "EQUAL" else None)
+            if result is None:
+                return False
+            step = next_step(ladder["step"], result)
+            self.db.execute("INSERT INTO live_ladder_results VALUES(?,?,?,?,?)",
+                            (ladder["last_attempt_id"], result, ladder["step"], step, now_ms))
+            self.db.execute("UPDATE live_ladder SET step=?,applied_attempt_id=?,updated_ms=? WHERE id=1",
+                            (step, ladder["last_attempt_id"], now_ms))
+            return True
 
     def reserve(self, row: dict, now_ms: int):
         if not isinstance(row, dict) or type(row.get("id")) is not int:
@@ -215,20 +352,48 @@ class LiveControl:
             # Consume the observation before any external action. A restart must
             # not replay a signal whose prior send outcome is uncertain.
             self.db.execute("UPDATE config SET cursor=?,updated_ms=? WHERE id=1", (observation_id, now_ms))
+            ladder = self.db.execute("SELECT * FROM live_ladder WHERE id=1").fetchone()
+            if (ladder and ladder["enabled"] and ladder["last_attempt_id"]
+                    and ladder["last_attempt_id"] != ladder["applied_attempt_id"]):
+                self._signal_event("LADDER_RESULT_PENDING", now_ms, config,
+                                   observation_id=observation_id)
+                return None
             direction = eligible_signal(row, now_ms, strategy=config["strategy"])
             if direction is None:
+                try:
+                    version = json.loads(row["decision"]).get("strategy_version")
+                except (KeyError, ValueError, TypeError):
+                    version = None
+                if version != config["strategy"]:
+                    code = "STRATEGY_MISMATCH"
+                elif (type(row.get("entry_ms")) is int and
+                      now_ms > row["entry_ms"] +
+                      (INTRABAR_ENTRY_LAG_MS if version in (STRATEGY, MULTI_STRATEGY) else MAX_ENTRY_LAG_MS)):
+                    code = "SIGNAL_EXPIRED"
+                else:
+                    code = "SIGNAL_INVALID"
+                self._signal_event(code, now_ms, config, observation_id=observation_id,
+                                   processing_lag_ms=now_ms-row["entry_ms"] if type(row.get("entry_ms")) is int else None)
                 return None
             mode = config["direction_mode"]
             if ((mode == "LONG_ONLY" and direction != "LONG")
                     or (mode == "SHORT_ONLY" and direction != "SHORT")):
+                self._signal_event("DIRECTION_FILTERED", now_ms, config, observation_id=observation_id,
+                                   processing_lag_ms=now_ms-row["entry_ms"])
                 return None
             if mode == "REVERSE":
                 direction = "SHORT" if direction == "LONG" else "LONG"
             ident = uuid4().hex
             self.db.execute("INSERT INTO attempts(id,observation_id,direction,amount,state,created_ms,updated_ms,bridge_attempt_id,expiry_ms,release_buffer_ms) VALUES(?,?,?,?,?,?,?,NULL,?,?)",
-                            (ident, observation_id, direction, config["amount"],
+                            (ident, observation_id, direction,
+                             json.loads(ladder["stakes"])[ladder["step"]] if ladder and ladder["enabled"] else config["amount"],
                              "RESERVED", now_ms, now_ms, row["entry_ms"] + config["horizon"] * 60_000,
                              300000 if config["cooldown_five_minutes"] else 60000))
+            if ladder and ladder["enabled"]:
+                self.db.execute("UPDATE live_ladder SET last_attempt_id=?,updated_ms=? WHERE id=1",
+                                (ident, now_ms))
+            self._signal_event("RESERVED", now_ms, config, observation_id=observation_id,
+                               processing_lag_ms=now_ms-row["entry_ms"])
             return dict(self.db.execute("SELECT * FROM attempts WHERE id=?", (ident,)).fetchone())
 
     def mark_unknown(self, ident: str, now_ms: int):
@@ -336,7 +501,7 @@ class LiveExecutor:
             self.control.finish(ident, now_ms, "SKIPPED")
             return self.control.attempt(ident)
         version = json.loads(observation["decision"]).get("strategy_version")
-        max_lag = INTRABAR_ENTRY_LAG_MS if version == STRATEGY else MAX_ENTRY_LAG_MS
+        max_lag = INTRABAR_ENTRY_LAG_MS if version in (STRATEGY, MULTI_STRATEGY) else MAX_ENTRY_LAG_MS
         if not observation["entry_ms"] <= self.clock() <= observation["entry_ms"] + max_lag:
             self.control.finish(ident, self.clock(), "SKIPPED")
             return self.control.attempt(ident)

@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
-from .live_api import LiveAPIError, change_live_state_from_site, live_public_origin, read_live_state
+from .live_api import LiveAPIError, change_live_state_from_site, change_signal_periods_from_site, live_public_origin, read_live_state
 from .live_stats import read_live_statistics_for_site
 from .stats import RESEARCH_THRESHOLD, dashboard
 from .status import health_overview, runner_active
@@ -112,10 +112,22 @@ HTML = r"""<!doctype html>
   <input id="live-strategy" type="hidden" value="bb_dual_touch_30m_intrabar_v2">
   <div class="live-form">
    <label for="live-period">周期<select id="live-period"><option value="10">10 分钟</option><option value="30" selected>30 分钟</option><option value="60">1 小时</option></select></label>
-   <label for="live-amount">金额（USDT）<input id="live-amount" type="number" inputmode="decimal" min="5" step="0.01" placeholder="至少 5 USDT"></label>
+   <label for="live-amount">固定金额（USDT）<input id="live-amount" type="number" inputmode="decimal" min="5" step="0.01" placeholder="至少 5 USDT"></label>
    <label for="live-direction-mode">方向<select id="live-direction-mode"><option value="SIGNAL">按信号</option><option value="REVERSE">反向</option><option value="LONG_ONLY">只做多</option><option value="SHORT_ONLY">只做空</option></select></label>
    <label for="live-cooldown">间隔<select id="live-cooldown"><option value="false">到期后 1 分钟</option><option value="true">到期后 5 分钟</option></select></label>
   </div>
+  <div class="live-form">
+   <label for="live-stake-mode">金额方式<select id="live-stake-mode"><option value="fixed">固定金额</option><option value="ladder">亏损阶梯</option></select></label>
+   <label for="live-stake-1">第 1 档（USDT）<input id="live-stake-1" type="number" inputmode="decimal" min="5" step="0.01" value="5"></label>
+   <label for="live-stake-2">第 2 档（USDT）<input id="live-stake-2" type="number" inputmode="decimal" min="5" step="0.01" value="7"></label>
+   <label for="live-stake-3">第 3 档（USDT）<input id="live-stake-3" type="number" inputmode="decimal" min="5" step="0.01" value="15"></label>
+  </div>
+  <div class="hint">亏损进入下一档；盈利或等价返本回到第 1 档；第 3 档亏损后重置。仅按指数代理结果推进。</div>
+  <div class="signal-periods" id="signal-periods"><strong>布林带触发周期</strong><div class="period-options">
+   <label><input type="checkbox" value="1m" checked>1m</label><label><input type="checkbox" value="5m" checked>5m</label>
+   <label><input type="checkbox" value="10m">10m</label><label><input type="checkbox" value="15m">15m</label>
+   <label><input type="checkbox" value="30m">30m</label><label><input type="checkbox" value="1h">1h</label>
+  </div><button id="save-signal-periods" type="button">保存周期</button><span id="signal-periods-state" class="hint">1m + 5m</span></div>
   <div class="notice" id="live-readiness">正在读取交易状态</div>
   <div class="live-actions"><button id="live-enable" type="button" disabled>启用</button><button id="live-disable" type="button" disabled>暂停</button><button id="live-review" type="button" hidden disabled>已核对上一笔</button></div>
   <div class="hint">赔付比例为接口配置值，非实时报价。请求状态与指数代理结果不等于币安成交和结算。</div>
@@ -166,16 +178,21 @@ HTML = r"""<!doctype html>
 (function(){
 "use strict";
 const $=id=>document.getElementById(id);
-const page=({"/":"overview","/records":"records","/statistics":"statistics","/live":"live"})[location.pathname]||"overview";
+const routes={"/":"overview","/records":"records","/statistics":"statistics","/live":"live"};
+let page=routes[location.pathname]||"overview";
 document.body.dataset.view=page;
 document.querySelectorAll(".section-nav a").forEach(a=>{if(a.dataset.nav===page)a.setAttribute("aria-current","page");});
 if(page==="records")$("mechanism").value="all";
 if(page==="records")document.body.dataset.recordKind="chart";
-if(page==="records")$("records-kind").addEventListener("change",e=>{document.body.dataset.recordKind=e.target.value;});
+$("records-kind").addEventListener("change",e=>{document.body.dataset.recordKind=e.target.value;if(page==="records")refreshRecords();});
 if(page==="live"){$("runner-pill").innerHTML='<i class="dot"></i> 正在读取交易开关';$("updated").textContent="等待状态";}
 document.querySelectorAll(".records-more").forEach(button=>button.addEventListener("click",()=>{const panel=$(button.dataset.more);panel.classList.toggle("expanded");button.textContent=panel.classList.contains("expanded")?"收起":"查看更多";}));
 document.querySelectorAll(".records-more").forEach(button=>{const body=$(button.dataset.more).querySelector("tbody");const update=()=>{button.hidden=body.rows.length<=5;};new MutationObserver(update).observe(body,{childList:true});update();});
 let latestOverview=null, latestChart=null, latestHistory=[], chartView=null, chartSeries=null, chartInterval=null, livePnlChart=null, livePnlSeries=null, livePnlPointCount=0;
+let savedPeriods=["1m","5m"],periodsLoaded=false,liveEnabled=false,ladderLoaded=false;
+function updateLadderControls(){const ladder=$("live-stake-mode").value==="ladder";$("live-amount").disabled=ladder||liveEnabled;for(const id of ["live-stake-1","live-stake-2","live-stake-3"])$(id).disabled=!ladder||liveEnabled;$("live-stake-mode").disabled=liveEnabled;}
+const selectedPeriods=()=>Array.from(document.querySelectorAll("#signal-periods input:checked"),item=>item.value);
+function updatePeriodControls(){const selected=selectedPeriods(),dirty=selected.join()!==savedPeriods.join();$("save-signal-periods").disabled=liveEnabled||!dirty||selected.length<2;$("live-enable").disabled=liveEnabled||dirty||selected.length<2;document.querySelectorAll("#signal-periods input").forEach(input=>input.disabled=liveEnabled);$("signal-periods-state").textContent=dirty?(selected.length<2?"至少选择两个周期":"尚未保存"):savedPeriods.join(" + ")+(savedPeriods.includes("10m")?" · 10m 由币安 5m 合成":"");}
 const esc=v=>String(v===null||v===undefined?"—":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const pct=v=>v===null||v===undefined?"—":(Number(v)*100).toFixed(1)+"%";
 const fmtTime=v=>v?new Date(Number(v)).toLocaleString("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}):"—";
@@ -187,10 +204,10 @@ function setPnl(id,v){const el=$(id);el.textContent=pnlText(v);el.className="met
 function renderOverview(data){
  latestOverview=data;
  const active=!!data.runner_active;
- $("runner-pill").innerHTML='<i class="dot '+(active?"ok":"")+'"></i>'+(active?"观察运行中":"观察已停止");
+ if(page!=="live")$("runner-pill").innerHTML='<i class="dot '+(active?"ok":"")+'"></i>'+(active?"观察运行中":"观察已停止");
  $("run-state").textContent=active?"运行中":"未运行";$("run-state").className="tag "+(active?"green":"");
  $("stop").disabled=!active;
- $("updated").textContent=fmtTime(data.timestamp_ms);
+ if(page!=="live")$("updated").textContent=fmtTime(data.timestamp_ms);
  const a=data.last_7_days||{},b=data.last_30_days||{};
  setPnl("pnl7",a.hypothetical_pnl_1u);setPnl("pnl30",b.hypothetical_pnl_1u);
  $("accuracy").textContent=pct(b.accuracy);$("accuracy-foot").textContent=(b.scored||0)+" 条已评分代理样本";
@@ -248,20 +265,27 @@ let scheduledLoaded=false;
 async function refreshScheduled(){try{const d=await api("/api/scheduled-paper");$("scheduled-worker").textContent=d.worker_active?"模拟服务运行中":"模拟服务未运行，配置不会执行";for(const h of [30,60]){const c=(d.configurations||[]).find(x=>x.horizon===h);$("scheduled-state-"+h).textContent=c&&c.enabled?"已启用":"未启用";if(!scheduledLoaded&&c){$("scheduled-direction-"+h).value=c.direction;$("scheduled-stake-"+h).value=c.stake;}}scheduledLoaded=true;const rs=d.orders||[];$("scheduled-history").innerHTML=rs.length?rs.map(r=>{const outcome=r.status==="MISSING"?"数据缺失":r.status==="PENDING"?"待到期":r.outcome==="WIN"?"赢":r.outcome==="LOSS"?"输":"未判定";return '<tr><td>'+esc(r.horizon===60?"1小时":"30分钟")+'</td><td>'+esc(r.direction==="HIGHER"?"看涨":"看跌")+'</td><td>'+esc(r.stake)+'</td><td>'+esc(fmtTime(r.entry_ms))+'</td><td>'+esc(fmtTime(r.expiry_ms))+'</td><td>'+esc(r.previous_close===null?"—":Number(r.previous_close).toFixed(0))+'</td><td>'+esc(r.next_close===null?"—":Number(r.next_close).toFixed(0))+'</td><td>'+esc(r.candle_outcome==="WIN"?"预测正确":r.candle_outcome==="LOSS"?"预测错误":"待确认")+'</td><td>'+esc(r.entry_price===null?"—":Number(r.entry_price).toFixed(0))+'</td><td>'+esc(r.exit_price===null?"—":Number(r.exit_price).toFixed(0))+'</td><td>'+esc(outcome)+'</td></tr>'}).join(""):'<tr><td colspan="11" class="empty">暂无模拟记录</td></tr>'; }catch(e){$("scheduled-history").innerHTML='<tr><td colspan="11" class="empty">模拟服务不可用</td></tr>';}}
 for(const h of [30,60])for(const enable of [true,false])$("scheduled-"+(enable?"start-":"stop-")+h).addEventListener("click",async()=>{try{const stake=$("scheduled-stake-"+h).value||(!enable?"1":"");await api("/api/scheduled-paper",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({horizon:h,enabled:enable,direction:$("scheduled-direction-"+h).value,stake})});toast(enable?"模拟已启用":"模拟已停止");refreshScheduled();}catch(e){toast("请填写有效金额，并确认模拟服务正在运行");}});
 function updateStrategyVisibility(){const mode=$("mechanism").value;if(mode==="CHART_30M"&&$("horizon").value==="60")$("horizon").value="30";$("chart-strategy-panel").hidden=(mode!=="all"&&mode!=="CHART_30M")||$("horizon").value==="60";$("model-history-panel").hidden=mode==="CHART_30M";$("model-metrics").hidden=mode==="CHART_30M"&&page!=="statistics";$("model-statistics").hidden=mode==="CHART_30M"&&page!=="statistics";}
-function updateLiveHeader(data){const active=!!data.enabled;$("live-footer-status").textContent=active?"交易运行中":"交易已暂停";if(page==="live"){$("runner-pill").innerHTML='<i class="dot '+(active?"ok":"")+'"></i> '+(active?"自动交易运行中":"自动交易已暂停");$("updated").textContent=active?data.horizon+" 分钟 · "+data.amount+" USDT":"BTCUSDT";}}
+function updateLiveHeader(data){const active=!!data.enabled,ready=data.collector_running!==false;$("live-footer-status").textContent=active?(ready?"交易运行中":"交易已启用 · 行情采集停止"):"交易已暂停";if(page==="live"){$("runner-pill").innerHTML='<i class="dot '+(active&&ready?"ok":"")+'"></i> '+(active?(ready?"自动交易运行中":"交易已启用 · 行情采集停止"):"自动交易已暂停");$("updated").textContent=active?data.horizon+" 分钟 · "+data.amount+" USDT":"BTCUSDT";}}
 function renderLive(data){
+ liveEnabled=!!data.enabled;
+ if(!ladderLoaded){$("live-stake-mode").value=data.ladder?.enabled?"ladder":"fixed";(data.ladder?.stakes||["5","7","15"]).forEach((stake,i)=>$("live-stake-"+(i+1)).value=stake);ladderLoaded=true;}
+ updateLadderControls();
+ if(!periodsLoaded){savedPeriods=data.signal_periods||["1m","5m"];document.querySelectorAll("#signal-periods input").forEach(input=>input.checked=savedPeriods.includes(input.value));periodsLoaded=true;}
+ $("live-strategy").value=savedPeriods.join()==="1m,5m"?"bb_dual_touch_30m_intrabar_v2":"bb_multi_touch_intrabar_v3";
+ updatePeriodControls();
  updateLiveHeader(data);
  const rows=data.attempts||[],cooldown=rows.find(r=>r.state==="API_ACCEPTED_UNVERIFIED");
- $("live-state-tag").textContent=data.enabled?(cooldown?"等待上笔到期":"运行中"):(cooldown?"已暂停 · 上笔待到期":"已暂停");
+ $("live-state-tag").textContent=data.enabled?(data.collector_running===false?"采集已停止":cooldown?"等待上笔到期":"运行中"):(cooldown?"已暂停 · 上笔待到期":"已暂停");
  $("live-state-tag").className="tag "+(data.enabled?"red":"amber");
- $("live-enable").disabled=!!data.enabled;$("live-disable").disabled=!data.enabled;
+ $("live-disable").disabled=!data.enabled;
  $("live-amount").max=data.max_amount;
  if(data.enabled){$("live-period").value=String(data.horizon);$("live-direction-mode").value=data.direction_mode||"SIGNAL";$("live-cooldown").value=String(!!data.cooldown_five_minutes);}
  if(data.amount&&!$("live-amount").value)$("live-amount").value=data.amount;
  $("live-readiness").textContent=data.enabled
-  ?(cooldown?"上一笔到期 "+fmtTime(cooldown.expiry_ms)+" · 下次最早 "+fmtTime(cooldown.expiry_ms+(cooldown.release_buffer_ms??(data.cooldown_five_minutes?300000:60000))):"等待新信号")
+  ?(data.collector_running===false?"行情采集已停止，当前不会生成新信号。":cooldown?"上一笔到期 "+fmtTime(cooldown.expiry_ms)+" · 下次最早 "+fmtTime(cooldown.expiry_ms+(cooldown.release_buffer_ms??(data.cooldown_five_minutes?300000:60000))):"等待新信号")
   :cooldown?"已暂停。上一笔仍会记录到期结果；新设置只用于后续信号。"
   :"已暂停。修改参数后可启用。";
+ if(data.ladder?.enabled)$("live-readiness").textContent+=" · 阶梯下一笔 "+data.ladder.next_amount+" USDT"+(data.ladder.waiting_for_result?"，等待上一笔指数代理结果":"");
  const unresolved=rows.find(r=>["API_ACCEPTED_UNVERIFIED","REJECTED_UNVERIFIED","UNKNOWN"].includes(r.state)&&r.bridge_attempt_id);
  $("live-review").hidden=!unresolved;$("live-review").disabled=!unresolved;$("live-review").dataset.attemptId=unresolved?unresolved.id:"";
  $("live-attempts").innerHTML=rows.length?rows.map(r=>'<tr><td>#'+esc(r.observation_id)+'</td><td>'+esc(fmtTime(r.created_ms))+'</td><td>'+esc(r.direction==="LONG"?"看涨":"看跌")+'</td><td>'+esc(r.amount)+" USDT"+'</td><td>'+esc(r.request_index_price_display??"—")+'</td><td>'+esc(r.proxy_exit_price_display??"—")+'</td><td>'+esc(r.proxy_result_label??"未判定")+'</td><td>'+esc(liveStateLabel[r.state]||"处理中")+' '+indicatorBadge(r)+'</td></tr>').join(""):'<tr><td colspan="8" class="empty">暂无自动请求</td></tr>';
@@ -290,18 +314,57 @@ function renderActualStats(data){
  livePnlChart.applyOptions({width:el.clientWidth,height:el.clientHeight});
 }
 async function refreshActualStats(){try{renderActualStats(await api("/api/live-statistics"));}catch(e){$("actual-statistics-status").textContent="统计数据暂不可用；请检查本机只读账本。";$("actual-statistics-rows").innerHTML='<tr><td colspan="8" class="empty">统计读取失败</td></tr>';}}
-const liveError={LIVE_AUTH_REQUIRED:"服务端交易授权不可用",INVALID_AMOUNT:"金额无效",INVALID_LIVE_CONFIGURATION:"金额或策略配置无效",BRIDGE_RECONCILE_REQUIRED:"桥接账本有待核对请求",UNRESOLVED_ATTEMPT:"上一笔请求仍待核对",STRATEGY_UNAVAILABLE:"该周期没有已定义策略",LIVE_SOURCE_UNAVAILABLE:"行情或桥接服务不可用"};
-$("live-enable").addEventListener("click",async()=>{const amount=$("live-amount").value;if(!amount){toast("请填写金额");return;}$("live-enable").disabled=true;try{const r=await api("/api/live",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"enable",strategy:$("live-strategy").value,horizon:Number($("live-period").value),amount,direction_mode:$("live-direction-mode").value,cooldown_five_minutes:$("live-cooldown").value==="true"})});renderLive(r);toast("持续自动交易已启用");}catch(e){toast(liveError[e.message]||"启用失败，请检查状态");refreshLive();}});
+const liveError={LIVE_AUTH_REQUIRED:"服务端交易授权不可用",INVALID_AMOUNT:"金额无效",INVALID_LADDER_STAKES:"阶梯金额需在 5 至上限之间，最多两位小数",INVALID_LIVE_CONFIGURATION:"金额或策略配置无效",BRIDGE_RECONCILE_REQUIRED:"桥接账本有待核对请求",UNRESOLVED_ATTEMPT:"上一笔请求仍待核对",STRATEGY_UNAVAILABLE:"该周期没有已定义策略",SIGNAL_PERIODS_CHANGED:"周期配置已变化，请刷新页面",LIVE_SOURCE_UNAVAILABLE:"行情或桥接服务不可用",LIVE_COLLECTOR_STOPPED:"行情采集已停止，无法启用交易"};
+$("live-stake-mode").addEventListener("change",updateLadderControls);
+$("live-enable").addEventListener("click",async()=>{const ladder=$("live-stake-mode").value==="ladder",stakes=ladder?[1,2,3].map(i=>$("live-stake-"+i).value):null,amount=ladder?stakes[0]:$("live-amount").value;if(!amount||ladder&&stakes.some(x=>!x)){toast("请填写金额");return;}$("live-enable").disabled=true;try{const r=await api("/api/live",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"enable",strategy:$("live-strategy").value,signal_periods:savedPeriods,horizon:Number($("live-period").value),amount,ladder_stakes:stakes,direction_mode:$("live-direction-mode").value,cooldown_five_minutes:$("live-cooldown").value==="true"})});renderLive(r);toast("持续自动交易已启用");}catch(e){toast(liveError[e.message]||"启用失败，请检查状态");refreshLive();}});
+document.querySelectorAll("#signal-periods input").forEach(input=>input.addEventListener("change",updatePeriodControls));
+$("save-signal-periods").addEventListener("click",async()=>{const periods=selectedPeriods();if(periods.length<2)return;$("save-signal-periods").disabled=true;try{const result=await api("/api/signal-periods",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({periods})});savedPeriods=result.signal_periods;$("live-strategy").value=result.strategy;updatePeriodControls();toast("触发周期已保存");}catch(e){toast(e.message==="DISABLE_BEFORE_CHANGING_PERIODS"?"请先暂停交易":"保存失败，请检查周期配置");refreshLive();}});
 $("live-disable").addEventListener("click",async()=>{try{renderLive(await api("/api/live",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"disable"})}));toast("已停用");}catch(e){toast("停用失败，请检查状态");refreshLive();}});
 $("live-review").addEventListener("click",async()=>{const attempt_id=$("live-review").dataset.attemptId;if(!attempt_id)return;if(!confirm("请先在币安核对上一笔请求。确认已检查交易记录并解除阻止？这里不会把请求标记为已成交或已结算。"))return;$("live-review").disabled=true;try{renderLive(await api("/api/live",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"review",attempt_id,checked_in_binance:true})}));toast("已记录人工核对");}catch(e){toast("核对失败，请检查桥接记录");refreshLive();}});
-function refreshAll(){updateStrategyVisibility();if(page==="overview"){refreshOverview();refreshChart();}else if(page==="records"){refreshScheduled();refreshHistory();refreshChartStrategy();}else if(page==="statistics"){refreshOverview();refreshActualStats();}else if(page==="live"){refreshLive();}}
+function refreshRecords(){const kind=$("records-kind").value;if(kind==="scheduled")refreshScheduled();else if(kind==="research")refreshHistory();else refreshChartStrategy();}
+function refreshAll(){updateStrategyVisibility();if(page==="overview"){refreshOverview();refreshChart();}else if(page==="records"){refreshRecords();}else if(page==="statistics"){refreshOverview();refreshActualStats();}else if(page==="live"){refreshLive();}}
+let overviewFilters={mechanism:"CHART_30M",horizon:"all"};
+function navigate(path,push=true){
+ const next=routes[path];if(!next)return;
+ if(page==="overview")overviewFilters={mechanism:$("mechanism").value,horizon:$("horizon").value};
+ if(push&&path!==location.pathname)history.pushState(null,"",path);
+ page=next;document.body.dataset.view=page;
+ document.querySelectorAll(".section-nav a").forEach(a=>{if(a.dataset.nav===page)a.setAttribute("aria-current","page");else a.removeAttribute("aria-current");});
+ if(page==="records"){$("mechanism").value="all";$("horizon").value="all";document.body.dataset.recordKind=$("records-kind").value;}
+ if(page==="overview"){$("mechanism").value=overviewFilters.mechanism;$("horizon").value=overviewFilters.horizon;}
+ if(page==="live"){$("runner-pill").innerHTML='<i class="dot"></i> 正在读取交易开关';$("updated").textContent="等待状态";}
+ refreshAll();window.scrollTo(0,0);
+}
+document.querySelectorAll(".section-nav a").forEach(a=>a.addEventListener("click",event=>{
+ if(event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;
+ event.preventDefault();if(a.pathname!==location.pathname)navigate(a.pathname);
+}));
+window.addEventListener("popstate",()=>navigate(location.pathname,false));
 ["interval","horizon","mechanism"].forEach(id=>$(id).addEventListener("change",()=>{updateStrategyVisibility();refreshChart();refreshHistory();refreshChartStrategy();}));
-$("stop").addEventListener("click",async()=>{if(!confirm("确认向当前 SHADOW 进程发送安全停止请求？不会触发任何交易。"))return;$("stop").disabled=true;try{const r=await api("/api/stop",{method:"POST"});toast(r.message||"已提交安全停止请求");setTimeout(refreshOverview,1500);}catch(e){toast(e.message);refreshOverview();}});
+$("stop").addEventListener("click",async()=>{if(!confirm("确认向当前 SHADOW 进程发送安全停止请求？不会触发任何交易。"))return;$("stop").disabled=true;try{const r=await api("/api/stop",{method:"POST"});toast(r.message||"已提交安全停止请求");setTimeout(refreshOverview,1500);}catch(e){toast(e.message==="LIVE_ENABLED_DISABLE_FIRST"?"请先暂停真实交易，再停止行情采集":e.message);refreshOverview();}});
 window.addEventListener("resize",()=>{if(latestChart)drawChart(latestChart);if(livePnlChart){const el=$("live-pnl-chart");livePnlChart.applyOptions({width:el.clientWidth,height:el.clientHeight});}});
-refreshAll();if(page==="overview"||page==="statistics")setInterval(refreshOverview,5000);if(page==="statistics")setInterval(refreshActualStats,15000);if(page==="overview")setInterval(refreshChart,15000);if(page==="records")setInterval(()=>{refreshHistory();refreshChartStrategy();refreshScheduled();},15000);if(page==="live")setInterval(refreshLive,5000);
+refreshAll();setInterval(()=>{if(page==="overview"||page==="statistics")refreshOverview();else if(page==="live")refreshLive();},5000);
+setInterval(()=>{if(page==="statistics")refreshActualStats();else if(page==="overview")refreshChart();else if(page==="records")refreshRecords();},15000);
 })();
 </script>
 </body></html>"""
+
+
+def page_html(path: str) -> str:
+    """Select the visible page in the first HTML response, before scripts load."""
+    view = {"/": "overview", "/records": "records", "/statistics": "statistics", "/live": "live"}[path]
+    record_kind = ' data-record-kind="chart"' if view == "records" else ""
+    return HTML.replace("<body>", f'<body data-view="{view}"{record_kind}>', 1)
+
+
+def collector_running(directory: Path | None) -> bool:
+    """Report the actual lock holder, not the website's saved trading switch."""
+    if directory is None:
+        return False
+    try:
+        return runner_active(directory)
+    except OSError:
+        return False
 
 
 def _connect_readonly(path: Path):
@@ -690,7 +753,9 @@ def indicator_history_status(payload) -> str:
     """Expose only source completeness, never the raw chart response."""
     try:
         chart = json.loads(payload)
-        flags = [chart[key]["truncated"] for key in ("five_min", "one_min")]
+        flags = [item["truncated"] for item in chart.values()]
+        if len(flags) < 2:
+            return "UNKNOWN"
     except (ValueError, TypeError, KeyError):
         return "UNKNOWN"
     if any(flag is True for flag in flags):
@@ -783,6 +848,11 @@ def build_chart_observations(path: Path, limit: int = 80,
                 elif status in (None, "PENDING"): label = "待到期"
             reason = decision.get("reason", "")
             direction_label, reason_label = chart_labels(direction, reason)
+            periods = decision.get("periods")
+            if (decision.get("strategy_version") == "bb_multi_touch_intrabar_v3"
+                    and isinstance(periods, list) and 2 <= len(periods) <= 6
+                    and reason in ("BOTH_LOWER_TOUCHED_INTRABAR", "BOTH_UPPER_TOUCHED_INTRABAR")):
+                reason_label = " + ".join(periods) + (" 盘中均触及布林下轨" if direction == "HIGHER" else " 盘中均触及布林上轨")
             if reason == "CONDITIONS_MET":
                 reason_label = ("收盘上穿布林中轨，高于均线和 AVWAP 低线，低于布林上轨" if direction == "HIGHER" else "收盘下穿布林中轨，低于均线和 AVWAP 高线，高于布林下轨")
             attempt = (attempts_by_observation or {}).get(row["id"])
@@ -873,7 +943,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path in ("/", "/records", "/statistics", "/live"):
-                body = HTML.encode("utf-8")
+                body = page_html(parsed.path).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -889,6 +959,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/live" and getattr(self.server, "live_config", None):
                 state = read_live_state(self.server.live_config)
                 directory = getattr(self.server, "data_directory", None)
+                state["collector_running"] = collector_running(directory)
                 if directory is not None:
                     settings = _parse_config(getattr(self.server, "config_path", None))
                     try:
@@ -999,10 +1070,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path not in ("/api/stop", "/api/scheduled-paper", "/api/live"):
+        if parsed.path not in ("/api/stop", "/api/scheduled-paper", "/api/live", "/api/signal-periods"):
             self._json({"error": "not_found"}, 404)
             return
-        if parsed.path == "/api/live" and not getattr(self.server, "live_config", None):
+        if parsed.path in ("/api/live", "/api/signal-periods") and not getattr(self.server, "live_config", None):
             self._json({"error": "not_found"}, 404)
             return
         if self.client_address[0] not in ("127.0.0.1", "::1"):
@@ -1013,7 +1084,7 @@ class Handler(BaseHTTPRequestHandler):
         if origin and urlparse(origin).netloc != host:
             self._json({"error": "origin_mismatch"}, 403)
             return
-        if parsed.path == "/api/live":
+        if parsed.path in ("/api/live", "/api/signal-periods"):
             try:
                 if (origin != live_public_origin(self.server.live_config)
                         or host != urlparse(origin).netloc
@@ -1025,8 +1096,18 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"error": "invalid_live_request"}, 400)
                     return
                 body = json.loads(self.rfile.read(length))
-                result = change_live_state_from_site(self.server.live_config, body,
-                                                     now_ms=time.time_ns() // 1_000_000)
+                if (parsed.path == "/api/live" and isinstance(body, dict)
+                        and body.get("action") == "enable"
+                        and getattr(self.server, "data_directory", None) is not None
+                        and not collector_running(self.server.data_directory)):
+                    raise LiveAPIError("LIVE_COLLECTOR_STOPPED")
+                if parsed.path == "/api/signal-periods":
+                    if not isinstance(body, dict) or set(body) != {"periods"}:
+                        raise LiveAPIError("INVALID_SIGNAL_PERIODS")
+                    result = change_signal_periods_from_site(self.server.live_config, body["periods"])
+                else:
+                    result = change_live_state_from_site(self.server.live_config, body,
+                                                         now_ms=time.time_ns() // 1_000_000)
                 self._json(result)
             except LiveAPIError as error:
                 status = 403 if str(error) == "LIVE_AUTH_REQUIRED" else 409
@@ -1048,6 +1129,14 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, OSError, sqlite3.Error):
                 self._json({"error":"invalid_or_unavailable"}, 400)
             return
+        if getattr(self.server, "live_config", None):
+            try:
+                if read_live_state(self.server.live_config, attempt_limit=1)["enabled"]:
+                    self._json({"error": "LIVE_ENABLED_DISABLE_FIRST"}, 409)
+                    return
+            except (LiveAPIError, OSError, sqlite3.Error, ValueError):
+                self._json({"error": "live_state_unavailable"}, 503)
+                return
         try:
             from .runner import request_safe_stop
             request_safe_stop(self.server.data_directory)

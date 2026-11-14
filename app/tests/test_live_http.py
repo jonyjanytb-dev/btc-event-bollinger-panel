@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from shadow.web import HTML, Handler, LocalServer
+from shadow.live_control import LiveControl
 
 
 class LiveHTTPTests(unittest.TestCase):
@@ -25,6 +26,12 @@ class LiveHTTPTests(unittest.TestCase):
                                           "chart_db": str(chart), "bridge_key_file": str(key),
                                           "max_amount": "30", "public_origin": "https://panel.example"}))
             config.chmod(0o600)
+            with LiveControl(root / "live.sqlite"):
+                pass
+            with sqlite3.connect(root / "bridge.sqlite") as db:
+                db.execute("CREATE TABLE attempts(id TEXT PRIMARY KEY,status TEXT,payload TEXT)")
+            (root / "live-statistics.json").write_text(json.dumps({
+                "start_ms": 1000, "bridge_ledger": str(root / "bridge.sqlite")}))
             server = LocalServer(("127.0.0.1", 0), Handler)
             server.live_config = config
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -35,6 +42,13 @@ class LiveHTTPTests(unittest.TestCase):
                 response = connection.getresponse()
                 self.assertEqual(response.status, 200)
                 self.assertEqual(json.loads(response.read())["enabled"], False)
+                connection.request("GET", "/api/live-statistics")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read())["requests"], 0)
+                self.assertIn('id="live-pnl-chart"', HTML)
+                for name in ("live-stake-mode", "live-stake-1", "live-stake-2", "live-stake-3"):
+                    self.assertIn('id="' + name + '"', HTML)
                 self.assertNotIn('id="live-authorization"', HTML)
                 request = json.dumps({"action": "enable", "strategy": "bb_dual_touch_30m_v1",
                                       "horizon": 30, "amount": "5"})

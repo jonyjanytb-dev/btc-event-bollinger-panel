@@ -133,8 +133,13 @@ def run_tick(control: LiveControl, chart_db: Path, bridge, now_ms: int,
             raise LiveControlError("BRIDGE_RELEASE_INVALID")
         control.release_accepted(attempt["id"], now_ms,
                                  attempt["bridge_attempt_id"], buffer_ms=effective_buffer_ms)
+    control.advance_ladder(now_ms)
     state = control.state()
     if not state["enabled"]:
+        # Persist why a valid chart observation produced no order while paused.
+        # Re-arming still starts at the latest observation; it never replays one.
+        control.audit_disabled_observations(
+            read_observations_after(chart_db, control.disabled_audit_cursor()), now_ms)
         return []
     results = []
     for row in read_observations_after(chart_db, state["cursor"]):

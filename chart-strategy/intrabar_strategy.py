@@ -1,4 +1,4 @@
-"""Isolated intrabar BTCUSDT dual Bollinger observer. Never submits an order."""
+"""Isolated intrabar BTCUSDT Bollinger observer. Never submits an order."""
 from __future__ import annotations
 
 import argparse
@@ -7,10 +7,12 @@ import os
 import signal
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import requests
+from shadow.signal_periods import DEFAULT_PERIODS, PERIOD_MS, periods_path, read_periods
 
 from chart_strategy import (RULES, open_db, reconstructed_band,
                             require_healthy_clock, require_healthy_index,
@@ -20,6 +22,27 @@ from chart_strategy import (RULES, open_db, reconstructed_band,
 INTRABAR = json.loads(Path(__file__).with_name("intrabar_rules.json").read_text())
 FIVE_MS = RULES["five_min"]["period_ms"]
 ONE_MS = RULES["one_min"]["period_ms"]
+PERIOD_KEYS = {"1m": "one_min", "5m": "five_min", "10m": "ten_min",
+               "15m": "fifteen_min", "30m": "thirty_min", "1h": "one_hour"}
+
+
+def aggregate_ten_minute(bars: list[list]) -> list[list]:
+    result = []
+    for bar in bars:
+        bucket = bar[0] // 600_000 * 600_000
+        if not result or result[-1][0] != bucket:
+            if bar[0] != bucket:
+                continue
+            result.append([bucket, *bar[1:]])
+        else:
+            current = result[-1]
+            if bar[0] != bucket + 300_000:
+                raise ValueError("MARKET_CANDLE_INVALID")
+            current[2] = str(max(Decimal(current[2]), Decimal(bar[2])))
+            current[3] = str(min(Decimal(current[3]), Decimal(bar[3])))
+            current[4] = bar[4]
+            current[5] = str(Decimal(current[5]) + Decimal(bar[5]))
+    return result
 
 
 def _current(data: dict, key: str, received_ms: int) -> dict:
@@ -70,51 +93,57 @@ def validate_snapshot(data: dict, received_ms: int) -> tuple[dict, dict]:
     return five, one
 
 
-class IntrabarDetector:
-    """Latch observed first touches within one forming 5m candle only."""
+def validate_selected_snapshot(data: dict, received_ms: int, periods: tuple[str, ...]) -> dict[str, dict]:
+    if type(received_ms) is not int or not isinstance(data, dict):
+        raise ValueError("INVALID_SNAPSHOT")
+    result = {period: _current(data, PERIOD_KEYS[period], received_ms) for period in periods}
+    for period, candle in result.items():
+        if candle["open_ms"] != received_ms // PERIOD_MS[period] * PERIOD_MS[period]:
+            raise ValueError("CHARTS_NOT_ALIGNED")
+    return result
 
-    def __init__(self):
+
+class IntrabarDetector:
+    """Latch same-side touches within each current candle, once per longest candle."""
+
+    def __init__(self, periods: tuple[str, ...] = DEFAULT_PERIODS):
+        self.periods = periods
         self.bucket = None
-        self.one_open = None
-        self.last_five = None
-        self.last_one = None
+        self.opens = {}
+        self.last = {}
+        self.lower = {}
+        self.upper = {}
         self.last_received_ms = None
-        self.five_lower = self.five_upper = False
-        self.one_lower = self.one_upper = False
         self.fired = False
 
     def observe(self, data: dict, received_ms: int) -> dict | None:
-        five, one = validate_snapshot(data, received_ms)
+        candles = validate_selected_snapshot(data, received_ms, self.periods)
+        longest = self.periods[-1]
         first = (self.last_received_ms is None or received_ms <= self.last_received_ms
                  or received_ms - self.last_received_ms > INTRABAR["max_observation_gap_ms"])
         self.last_received_ms = received_ms
-        if self.bucket != five["open_ms"] or first:
-            self.bucket = five["open_ms"]
-            self.one_open = one["open_ms"]
-            self.five_lower = self.five_upper = False
-            self.one_lower = self.one_upper = False
+        if self.bucket != candles[longest]["open_ms"] or first:
+            self.bucket = candles[longest]["open_ms"]
+            self.opens = {}
+            self.last = {}
+            self.lower = {}
+            self.upper = {}
             self.fired = False
-            # On a process restart, a past candle wick is not a new live touch.
-            self.last_five = (five["high"], five["low"]) if first else (five["open"], five["open"])
-            self.last_one = (one["high"], one["low"]) if first else (one["open"], one["open"])
-            if first:
-                return None
-        if self.one_open != one["open_ms"]:
-            self.one_open = one["open_ms"]
-            self.last_one = (one["open"], one["open"])
-
-        prior_high, prior_low = self.last_five
-        self.five_upper |= five["high"] > prior_high and five["high"] >= five["upper"]
-        self.five_lower |= five["low"] < prior_low and five["low"] <= five["lower"]
-        self.last_five = (max(prior_high, five["high"]), min(prior_low, five["low"]))
-
-        prior_high, prior_low = self.last_one
-        self.one_upper |= one["high"] > prior_high and one["high"] >= one["upper"]
-        self.one_lower |= one["low"] < prior_low and one["low"] <= one["lower"]
-        self.last_one = (max(prior_high, one["high"]), min(prior_low, one["low"]))
-
-        lower = self.five_lower and self.one_lower
-        upper = self.five_upper and self.one_upper
+        for period, candle in candles.items():
+            if self.opens.get(period) != candle["open_ms"]:
+                self.opens[period] = candle["open_ms"]
+                self.lower[period] = self.upper[period] = False
+                self.last[period] = ((candle["high"], candle["low"]) if first
+                                     else (candle["open"], candle["open"]))
+            prior_high, prior_low = self.last[period]
+            if not first:
+                self.upper[period] |= candle["high"] > prior_high and candle["high"] >= candle["upper"]
+                self.lower[period] |= candle["low"] < prior_low and candle["low"] <= candle["lower"]
+            self.last[period] = (max(prior_high, candle["high"]), min(prior_low, candle["low"]))
+        if first:
+            return None
+        lower = all(self.lower.values())
+        upper = all(self.upper.values())
         if self.fired or (lower and upper):
             if lower and upper:
                 self.fired = True
@@ -126,17 +155,20 @@ class IntrabarDetector:
         entry_ms = received_ms
         return {"direction": direction,
                 "reason": "BOTH_LOWER_TOUCHED_INTRABAR" if lower else "BOTH_UPPER_TOUCHED_INTRABAR",
-                "bar_open_ms": five["open_ms"],
-                "bar_close_ms": five["open_ms"] + FIVE_MS,
-                "one_open_ms": one["open_ms"],
+                "bar_open_ms": candles[longest]["open_ms"],
+                "bar_close_ms": candles[longest]["open_ms"] + PERIOD_MS[longest],
+                "one_open_ms": candles.get("1m", {}).get("open_ms"),
+                "periods": list(self.periods),
+                "period_open_ms": {period: candles[period]["open_ms"] for period in self.periods},
                 "entry_ms": entry_ms,
                 "expiry_ms": entry_ms + RULES["horizon_ms"],
-                "strategy_version": INTRABAR["strategy_version"],
+                "strategy_version": (INTRABAR["strategy_version"] if self.periods == DEFAULT_PERIODS
+                                     else INTRABAR["multi_strategy_version"]),
                 "source": RULES["source_id"]}
 
 
 def save_candidate(path: Path, data: dict, decision: dict) -> bool:
-    """Use the existing unique 5m key; a restart cannot create a second candidate."""
+    """Use the existing unique candle key; a restart cannot duplicate a candidate."""
     db = open_db(path)
     try:
         with db:
@@ -151,7 +183,7 @@ def save_candidate(path: Path, data: dict, decision: dict) -> bool:
 
 
 class BinanceRestIntrabarClient:
-    """Two bounded read-only REST calls per poll; no browser session or trade API."""
+    """Bounded concurrent read-only REST calls; no browser session or trade API."""
 
     def __init__(self, session=None, clock=None, sleep=None):
         self.session = session or requests.Session()
@@ -161,9 +193,11 @@ class BinanceRestIntrabarClient:
 
     def _bars(self, key: str, asof_ms: int) -> dict:
         spec = RULES[key]
-        period = spec["period_ms"]
-        params = {"symbol": RULES["symbol"], "interval": spec["interval"],
-                  "endTime": asof_ms, "limit": INTRABAR["market_history_bars"]}
+        synthetic = key == "ten_min"
+        period = FIVE_MS if synthetic else spec["period_ms"]
+        limit = INTRABAR["market_history_bars"] * (2 if synthetic else 1)
+        params = {"symbol": RULES["symbol"], "interval": "5m" if synthetic else spec["interval"],
+                  "endTime": asof_ms, "limit": limit}
         for attempt in range(INTRABAR["request_attempts"]):
             try:
                 response = self.session.get(RULES["market_data_url"], params=params,
@@ -176,27 +210,46 @@ class BinanceRestIntrabarClient:
                 if attempt + 1 == INTRABAR["request_attempts"]:
                     raise ValueError("MARKET_REQUEST_FAILED") from None
                 self.sleep(INTRABAR["retry_delay_seconds"])
-        if not isinstance(raw, list) or len(raw) != INTRABAR["market_history_bars"]:
+        if not isinstance(raw, list) or len(raw) != limit:
             raise ValueError("MARKET_HISTORY_UNAVAILABLE")
         bars = []
         for item in raw:
             if (not isinstance(item, list) or len(item) < 7 or type(item[0]) is not int
                     or type(item[6]) is not int or item[6] != item[0] + period - 1
-                    or item[0] > asof_ms or (bars and item[0] != bars[-1][0] + period)):
+                    or item[0] % period or item[0] > asof_ms
+                    or (bars and item[0] != bars[-1][0] + period)):
+                raise ValueError("MARKET_CANDLE_INVALID")
+            try:
+                opened, high, low, closed, volume = (Decimal(str(item[i])) for i in (1, 2, 3, 4, 5))
+            except (InvalidOperation, TypeError):
+                raise ValueError("MARKET_CANDLE_INVALID") from None
+            if (not all(value.is_finite() for value in (opened, high, low, closed, volume))
+                    or min(opened, high, low, closed) <= 0 or volume < 0
+                    or not low <= min(opened, closed) <= max(opened, closed) <= high):
                 raise ValueError("MARKET_CANDLE_INVALID")
             bars.append([item[0], *(str(item[i]) for i in (1, 2, 3, 4, 5))])
-        return {"status": "ok", "source": RULES["source_id"], "truncated": False,
-                "symbol": RULES["symbol"], "interval": spec["interval"],
-                "candles": bars}
+        if synthetic:
+            bars = aggregate_ten_minute(bars)
+            if len(bars) != INTRABAR["market_history_bars"]:
+                raise ValueError("MARKET_HISTORY_UNAVAILABLE")
+        result = {"status": "ok", "source": RULES["source_id"], "truncated": False,
+                  "symbol": RULES["symbol"], "interval": spec["interval"],
+                  "candles": bars}
+        if synthetic:
+            result["derived_from"] = "5m"
+        return result
 
-    def snapshot(self) -> tuple[dict, int]:
+    def snapshot(self, periods: tuple[str, ...] = DEFAULT_PERIODS) -> tuple[dict, int]:
         started = self.clock()
-        data = {key: self._bars(key, started) for key in ("five_min", "one_min")}
+        keys = tuple(dict.fromkeys(PERIOD_KEYS[period] for period in periods))
+        with ThreadPoolExecutor(max_workers=len(keys)) as pool:
+            payloads = list(pool.map(lambda key: self._bars(key, started), keys))
+        data = dict(zip(keys, payloads))
         received = self.clock()
         if (received < started or received - started > INTRABAR["max_snapshot_duration_ms"]
                 or received // ONE_MS != started // ONE_MS):
             raise ValueError("SNAPSHOT_STALE")
-        validate_snapshot(data, received)
+        validate_selected_snapshot(data, received, periods)
         return data, received
 
 
@@ -211,7 +264,8 @@ def main() -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.umask(0o077)
     client = BinanceRestIntrabarClient()
-    detector = IntrabarDetector()
+    selected = read_periods(periods_path(path))
+    detector = IntrabarDetector(selected)
     stopped = False
     next_proxy_at = time.monotonic()
 
@@ -225,7 +279,11 @@ def main() -> None:
         while not stopped:
             cycle_started = time.monotonic()
             try:
-                data, received = client.snapshot()
+                current_selection = read_periods(periods_path(path))
+                if current_selection != selected:
+                    selected = current_selection
+                    detector = IntrabarDetector(selected)
+                data, received = client.snapshot(selected)
                 require_healthy_clock(args.ticks_db, received, config["health_max_age_ms"],
                                       config["clock_max_error_ms"])
                 require_healthy_index(args.ticks_db, received, config["tick_max_delay_ms"])

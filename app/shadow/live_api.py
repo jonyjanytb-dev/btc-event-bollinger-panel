@@ -9,8 +9,9 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from .live_bridge import BridgeClient, BridgeRejected, BridgeUnavailable
-from .live_control import LiveControl, LiveControlError, STRATEGY, SUPPORTED_STRATEGIES, PERIOD_ENUMS, DIRECTION_MODES
+from .live_control import LiveControl, LiveControlError, STRATEGY, MULTI_STRATEGY, SUPPORTED_STRATEGIES, PERIOD_ENUMS, DIRECTION_MODES
 from .live_worker import latest_observation_id
+from .signal_periods import DEFAULT_PERIODS, periods_path, read_periods, save_periods
 
 
 class LiveAPIError(RuntimeError):
@@ -51,7 +52,8 @@ def _safe_state(config: dict, attempt_limit: int = 20) -> dict:
     if not path.is_file():
         return {"enabled": False, "strategy": STRATEGY, "horizon": 30, "reverse": False, "direction_mode": "SIGNAL", "cooldown_five_minutes": False,
                 "amount": None, "attempts": [], "accepted_unverified_count": 0,
-                "max_amount": config["max_amount"]}
+                "max_amount": config["max_amount"],
+                "ladder": {"enabled": False, "stakes": ["5", "7", "15"], "step": 0, "next_amount": "5", "waiting_for_result": False}}
     try:
         uri = "file:" + quote(str(path.resolve(strict=True)), safe="/") + "?mode=ro"
         with sqlite3.connect(uri, uri=True, timeout=2) as db:
@@ -76,6 +78,15 @@ def _safe_state(config: dict, attempt_limit: int = 20) -> dict:
                 (max(1, min(attempt_limit, 200)),))]
             accepted_count = db.execute(
                 "SELECT COUNT(*) FROM attempts WHERE state IN ('API_ACCEPTED_UNVERIFIED','TIME_EXPIRED_UNVERIFIED')").fetchone()[0]
+            has_ladder = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='live_ladder'").fetchone() is not None
+            ladder_row = db.execute("SELECT * FROM live_ladder WHERE id=1").fetchone() if has_ladder else None
+            stakes = json.loads(ladder_row["stakes"]) if ladder_row else ["5", "7", "15"]
+            ladder = {"enabled": bool(ladder_row["enabled"]) if ladder_row else False,
+                      "stakes": stakes, "step": ladder_row["step"] if ladder_row else 0,
+                      "next_amount": stakes[ladder_row["step"]] if ladder_row else stakes[0],
+                      "waiting_for_result": bool(ladder_row and ladder_row["enabled"]
+                                                 and ladder_row["last_attempt_id"]
+                                                 and ladder_row["last_attempt_id"] != ladder_row["applied_attempt_id"])}
         return {"enabled": bool(row["enabled"]) if row else False,
                 "strategy": row["strategy"] if row else STRATEGY,
                 "horizon": row["horizon"] if row else 30,
@@ -84,13 +95,28 @@ def _safe_state(config: dict, attempt_limit: int = 20) -> dict:
                 "cooldown_five_minutes": bool(row["cooldown_five_minutes"]) if row and "cooldown_five_minutes" in columns else False,
                 "amount": row["amount"] if row else None,
                 "attempts": attempts, "accepted_unverified_count": accepted_count,
-                "max_amount": config["max_amount"]}
+                "max_amount": config["max_amount"], "ladder": ladder}
     except sqlite3.Error:
         raise LiveAPIError("LIVE_LEDGER_UNAVAILABLE") from None
 
 
 def read_live_state(config_path: Path, attempt_limit: int = 20) -> dict:
-    return _safe_state(_settings(config_path), attempt_limit)
+    config = _settings(config_path)
+    state = _safe_state(config, attempt_limit)
+    state["signal_periods"] = list(read_periods(periods_path(config["chart_db"])))
+    return state
+
+
+def change_signal_periods_from_site(config_path: Path, periods) -> dict:
+    config = _settings(config_path)
+    with LiveControl(Path(config["control_db"])) as control:
+        if control.state() and control.state()["enabled"]:
+            raise LiveAPIError("DISABLE_BEFORE_CHANGING_PERIODS")
+        try:
+            selected = save_periods(periods_path(config["chart_db"]), periods)
+        except (OSError, ValueError):
+            raise LiveAPIError("INVALID_SIGNAL_PERIODS") from None
+    return {"signal_periods": list(selected), "strategy": STRATEGY if selected == DEFAULT_PERIODS else MULTI_STRATEGY}
 
 
 def change_live_state_from_site(config_path: Path, body: dict, *, now_ms: int,
@@ -155,7 +181,7 @@ def change_live_state(config_path: Path, body: dict, *, now_ms: int,
             raise LiveAPIError("BRIDGE_UNAVAILABLE") from None
         return _safe_state(config)
     required = {"action", "strategy", "horizon", "amount", "authorization"}
-    if action != "enable" or not required <= set(body) <= required | {"reverse", "cooldown_five_minutes", "direction_mode"}:
+    if action != "enable" or not required <= set(body) <= required | {"reverse", "cooldown_five_minutes", "direction_mode", "signal_periods", "ladder_stakes"}:
         raise LiveAPIError("INVALID_LIVE_REQUEST")
     if type(body.get("reverse", False)) is not bool or type(body.get("cooldown_five_minutes", False)) is not bool:
         raise LiveAPIError("INVALID_LIVE_CONFIGURATION")
@@ -169,7 +195,15 @@ def change_live_state(config_path: Path, body: dict, *, now_ms: int,
     key = _private_file(Path(config["bridge_key_file"])).read_text().strip()
     if not hmac.compare_digest(supplied, key):
         raise LiveAPIError("LIVE_AUTH_REQUIRED")
-    if body["strategy"] not in SUPPORTED_STRATEGIES or type(body["horizon"]) is not int or body["horizon"] not in PERIOD_ENUMS:
+    selected = read_periods(periods_path(config["chart_db"]))
+    if (body["strategy"] == MULTI_STRATEGY and body.get("signal_periods") != list(selected)):
+        raise LiveAPIError("SIGNAL_PERIODS_CHANGED")
+    if ("signal_periods" in body and body["signal_periods"] != list(selected)):
+        raise LiveAPIError("SIGNAL_PERIODS_CHANGED")
+    if (body["strategy"] not in SUPPORTED_STRATEGIES
+            or (selected != DEFAULT_PERIODS and body["strategy"] != MULTI_STRATEGY)
+            or (selected == DEFAULT_PERIODS and body["strategy"] == MULTI_STRATEGY)
+            or type(body["horizon"]) is not int or body["horizon"] not in PERIOD_ENUMS):
         raise LiveAPIError("STRATEGY_UNAVAILABLE")
     if not isinstance(body["amount"], str):
         raise LiveAPIError("INVALID_AMOUNT")
@@ -195,7 +229,7 @@ def change_live_state(config_path: Path, body: dict, *, now_ms: int,
                            current_observation_id=cursor, now_ms=now_ms,
                            reverse=body.get("reverse", False),
                            cooldown_five_minutes=body.get("cooldown_five_minutes", False),
-                           direction_mode=mode)
+                           direction_mode=mode, ladder_stakes=body.get("ladder_stakes"))
     except LiveControlError as error:
         raise LiveAPIError(str(error)) from None
     except (BridgeUnavailable, BridgeRejected):

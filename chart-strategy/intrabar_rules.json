@@ -1,5 +1,6 @@
 {
   "strategy_version": "bb_dual_touch_30m_intrabar_v2",
+  "multi_strategy_version": "bb_multi_touch_intrabar_v3",
   "poll_seconds": 1.0,
   "request_timeout_seconds": 2.0,
   "request_attempts": 2,
